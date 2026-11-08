@@ -1,13 +1,25 @@
+/*
+ * Função deste arquivo: ser o ponto de entrada (main) do processo cliente.
+ *
+ * Ele oferece duas formas de jogar, ambas falando com o servidor apenas
+ * via Java RMI (lookup de "Quoridor" no Registry e chamadas a GameService):
+ *  - padrão: interface gráfica Swing (delegada para GameFrame.launch);
+ *  - opcional: cliente em modo console/texto, ativado com --console ou -c,
+ *    implementado nesta própria classe (loop de comandos, desenho do
+ *    tabuleiro em texto e uma thread vigia de desconexão).
+ */
 package br.uesc.quoridor.client;
 
 import br.uesc.quoridor.client.ui.GameFrame;
 import br.uesc.quoridor.common.*;
 
+import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Scanner;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Cliente Quoridor.
@@ -16,16 +28,44 @@ import java.util.Scanner;
  */
 public class ClientMain {
 
+    /** Stub RMI do objeto remoto do servidor (obtido via lookup). */
     private final GameService service;
+
+    /** Leitor dos comandos digitados no console. */
     private final Scanner scanner;
+
+    /** Indica se o loop/vigia do cliente ainda devem continuar rodando. */
+    private final AtomicBoolean running = new AtomicBoolean(true);
+
+    /** Garante que o aviso de saída (leave) seja enviado uma única vez. */
+    private final AtomicBoolean left = new AtomicBoolean(false);
+
+    /** Garante que o aviso de "partida encerrada" seja mostrado uma única vez. */
+    private final AtomicBoolean disconnectNotified = new AtomicBoolean(false);
+
+    /** ID deste jogador na partida (0..3); -1 enquanto não entrou. */
     private int playerId = -1;
 
+    /**
+     * Cria o cliente de console já ligado ao stub do servidor.
+     *
+     * @param service stub RMI de GameService obtido no Registry
+     */
     public ClientMain(GameService service) {
         this.service = service;
         this.scanner = new Scanner(System.in);
     }
 
+    /**
+     * Ponto de entrada do processo cliente. Separa o argumento
+     * {@code --console}/{@code -c} dos demais (host/porta) e decide:
+     * com {@code --console}, roda o cliente em texto nesta classe; sem
+     * ele, delega para a interface gráfica Swing.
+     *
+     * @param args argumentos da linha de comando: [--console|-c] [host] [porta]
+     */
     public static void main(String[] args) {
+        // Separa a flag de modo console dos argumentos host/porta.
         List<String> filtered = new ArrayList<>();
         boolean console = false;
 
@@ -47,6 +87,14 @@ public class ClientMain {
         runConsole(rest);
     }
 
+    /**
+     * Executa o cliente em modo console: pergunta nome/host/porta (quando
+     * não vieram por argumento), localiza o serviço "Quoridor" no RMI
+     * Registry, entra na partida (join), registra o gancho de saída e
+     * entra no loop de comandos.
+     *
+     * @param args argumentos restantes: [host] [porta], ambos opcionais
+     */
     private static void runConsole(String[] args) {
         try {
             Scanner input = new Scanner(System.in);
@@ -57,6 +105,7 @@ public class ClientMain {
             String host;
             int port;
 
+            // Host: argumento, ou pergunta com padrão "localhost".
             if (args.length >= 1) {
                 host = args[0];
             } else {
@@ -67,6 +116,7 @@ public class ClientMain {
                 }
             }
 
+            // Porta: argumento, ou pergunta com padrão 1099.
             if (args.length >= 2) {
                 port = Integer.parseInt(args[1]);
             } else {
@@ -75,27 +125,48 @@ public class ClientMain {
                 port = value.isBlank() ? 1099 : Integer.parseInt(value);
             }
 
+            // Conexão RMI: obtém o Registry e faz lookup do objeto remoto.
             Registry registry = LocateRegistry.getRegistry(host, port);
             GameService service = (GameService) registry.lookup("Quoridor");
 
             ClientMain client = new ClientMain(service);
             client.playerId = service.join(name);
+            // Se o processo for encerrado (Ctrl+C, fechar terminal...),
+            // avisa o servidor para encerrar a partida para os demais.
+            Runtime.getRuntime().addShutdownHook(new Thread(client::leaveQuietly, "quoridor-leave"));
+            client.startWatcher();
 
             System.out.println();
             System.out.println("Você é o jogador " + (client.playerId + 1) + ".");
             System.out.println("Aguardando os outros jogadores...");
             client.loop();
+            client.running.set(false);
 
         } catch (Exception e) {
             System.err.println("Erro no cliente: " + e.getMessage());
         }
     }
 
+    /**
+     * Loop principal do modo console: a cada iteração busca o estado no
+     * servidor, redesenha a tela, verifica fim de partida (vitória ou
+     * abandono) e interpreta o comando digitado (mover, colocar parede,
+     * estado, ajuda ou sair), delegando sempre a validação ao servidor.
+     */
     private void loop() {
         while (true) {
             try {
                 GameState state = service.getState();
                 printState(state);
+
+                // Partida encerrada porque alguém se desconectou.
+                if (state.abandoned()) {
+                    running.set(false);
+                    if (disconnectNotified.compareAndSet(false, true)) {
+                        System.out.println("Partida encerrada.");
+                    }
+                    break;
+                }
 
                 if (state.winner() != null) {
                     System.out.println("Partida encerrada.");
@@ -107,8 +178,12 @@ public class ClientMain {
 
                 String command = scanner.nextLine().trim();
 
+                // Comando de saída: avisa o servidor e encerra o loop.
                 if (command.equalsIgnoreCase("sair")) {
-                    service.leave(playerId);
+                    running.set(false);
+                    disconnectNotified.set(true);
+                    leaveQuietly();
+                    System.out.println("Você saiu. A partida foi encerrada.");
                     break;
                 }
 
@@ -118,11 +193,14 @@ public class ClientMain {
                 }
 
                 if (command.equalsIgnoreCase("estado")) {
+                    // Apenas volta ao topo do loop, que redesenha o estado.
                     continue;
                 }
 
                 try {
                     if (command.toLowerCase().startsWith("m ")) {
+                        // Movimento: "m LINHA COLUNA" (casa exata) ou
+                        // "m <direção>" (cima/baixo/esquerda/direita).
                         String[] parts = command.substring(2).trim().split("\\s+");
                         if (parts.length == 2) {
                             int row = Integer.parseInt(parts[0]);
@@ -137,6 +215,7 @@ public class ClientMain {
                         System.out.println(state.message());
 
                     } else if (command.toLowerCase().startsWith("p ")) {
+                        // Parede: "p h LINHA COLUNA" ou "p v LINHA COLUNA".
                         String[] parts = command.split("\\s+");
 
                         if (parts.length != 4) {
@@ -170,10 +249,12 @@ public class ClientMain {
                     }
 
                 } catch (Exception e) {
+                    // Jogada inválida ou erro de digitação: mostra e continua.
                     System.out.println("ERRO: " + e.getMessage());
                 }
 
             } catch (Exception e) {
+                // Falha de comunicação com o servidor encerra o cliente.
                 System.err.println("Falha na comunicação com o servidor: "
                         + e.getMessage());
                 break;
@@ -181,6 +262,65 @@ public class ClientMain {
         }
     }
 
+    /**
+     * Inicia a thread vigia ("watcher"): enquanto o cliente roda, consulta
+     * o servidor a cada 700 ms apenas para detectar se a partida foi
+     * encerrada pela saída de outro jogador; nesse caso, avisa no console
+     * e encerra o processo mesmo que o usuário esteja parado no prompt.
+     */
+    private void startWatcher() {
+        Thread watcher = new Thread(() -> {
+            while (running.get()) {
+                try {
+                    Thread.sleep(700);
+                    if (!running.get()) {
+                        return;
+                    }
+                    GameState state = service.getState();
+                    if (state.abandoned() && disconnectNotified.compareAndSet(false, true)) {
+                        running.set(false);
+                        System.out.println();
+                        System.out.println(state.message());
+                        System.out.println("Partida encerrada.");
+                        System.exit(0);
+                    }
+                } catch (InterruptedException e) {
+                    // Thread interrompida: encerra o vigia silenciosamente.
+                    return;
+                } catch (Exception ignored) {
+                    // Falha pontual de consulta não encerra a partida.
+                }
+            }
+        }, "quoridor-watch");
+        watcher.setDaemon(true);
+        watcher.start();
+    }
+
+    /**
+     * Avisa o servidor que este jogador está saindo, no máximo uma vez e
+     * sem propagar erros (daí "quietly"): é chamada tanto na saída normal
+     * (comando "sair") quanto no shutdown hook do processo.
+     */
+    private void leaveQuietly() {
+        running.set(false);
+        disconnectNotified.set(true);
+        if (playerId < 0 || !left.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            service.leave(playerId);
+        } catch (RemoteException ignored) {
+            // Servidor já inacessível: não há mais nada a avisar.
+        }
+    }
+
+    /**
+     * Desenha a tela inteira do modo console: cabeçalho, situação da
+     * partida (ou espera por jogadores), lista de jogadores, tabuleiro
+     * em texto e o rodapé com os comandos disponíveis.
+     *
+     * @param state estado atual recebido do servidor
+     */
     private void printState(GameState state) {
         clearScreen();
 
@@ -219,6 +359,12 @@ public class ClientMain {
         System.out.println("          estado | ajuda | sair");
     }
 
+    /**
+     * Imprime a lista de jogadores com símbolo, nome, posição do peão,
+     * paredes restantes e a marca "&lt;== VEZ" ao lado de quem joga agora.
+     *
+     * @param state estado atual recebido do servidor
+     */
     private void printPlayers(GameState state) {
         System.out.println("Jogadores:");
 
@@ -239,9 +385,17 @@ public class ClientMain {
         }
     }
 
+    /**
+     * Desenha o tabuleiro 9x9 em texto: '.' para casas vazias, o símbolo
+     * de cada jogador na sua casa, '|' para paredes verticais e '---'
+     * para paredes horizontais entre as linhas.
+     *
+     * @param state estado atual recebido do servidor
+     */
     private void printBoard(GameState state) {
         System.out.println("Tabuleiro:");
 
+        // Monta primeiro a grade só com casas e peões...
         char[][] board = new char[9][9];
 
         for (int r = 0; r < 9; r++) {
@@ -254,6 +408,7 @@ public class ClientMain {
             board[p.row()][p.col()] = p.symbol();
         }
 
+        // ...depois imprime linha a linha, intercalando as paredes.
         for (int r = 0; r < 9; r++) {
             System.out.print("    ");
 
@@ -298,6 +453,16 @@ public class ClientMain {
         System.out.println("Coordenadas de paredes: linha/coluna 0..7");
     }
 
+    /**
+     * Verifica, só para o desenho em texto, se existe parede horizontal
+     * cobrindo a aresta abaixo da casa (row, col) — lembrando que cada
+     * parede cobre duas colunas: {@code col} e {@code col + 1} do seu canto.
+     *
+     * @param state estado atual recebido do servidor
+     * @param row   linha da casa
+     * @param col   coluna da casa
+     * @return {@code true} se houver parede horizontal sob a casa
+     */
     private boolean hasHorizontalWall(GameState state, int row, int col) {
         return state.walls().stream().anyMatch(w ->
                 w.orientation() == WallOrientation.HORIZONTAL &&
@@ -306,6 +471,16 @@ public class ClientMain {
         );
     }
 
+    /**
+     * Verifica, só para o desenho em texto, se existe parede vertical
+     * cobrindo a aresta à direita da casa (row, col) — lembrando que cada
+     * parede cobre duas linhas: {@code row} e {@code row + 1} do seu canto.
+     *
+     * @param state estado atual recebido do servidor
+     * @param row   linha da casa
+     * @param col   coluna da casa
+     * @return {@code true} se houver parede vertical à direita da casa
+     */
     private boolean hasVerticalWall(GameState state, int row, int col) {
         return state.walls().stream().anyMatch(w ->
                 w.orientation() == WallOrientation.VERTICAL &&
@@ -314,6 +489,10 @@ public class ClientMain {
         );
     }
 
+    /**
+     * Imprime o texto de ajuda do modo console, com a sintaxe dos
+     * comandos de movimento e de parede e exemplos de uso.
+     */
     private void printHelp() {
         System.out.println();
         System.out.println("============= AJUDA =============");
@@ -340,6 +519,10 @@ public class ClientMain {
         System.out.println("=================================");
     }
 
+    /**
+     * Limpa a tela do terminal usando códigos de escape ANSI, para que
+     * cada redesenho do estado substitua o anterior.
+     */
     private void clearScreen() {
         System.out.print("\033[H\033[2J");
         System.out.flush();

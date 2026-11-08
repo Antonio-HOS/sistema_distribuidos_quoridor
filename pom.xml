@@ -1,21 +1,36 @@
+<!--
+  Função deste arquivo: descrever o projeto para o Maven (build do Quoridor RMI).
+
+  Ele define as coordenadas do artefato (grupo, nome e versão), a versão
+  do Java utilizada (17) e os plugins de compilação e empacotamento.
+  Não há dependências externas: o projeto usa apenas a biblioteca padrão
+  do Java (RMI e Swing). É este arquivo que permite compilar e gerar o
+  pacote com "mvn clean package".
+-->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
          https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <!-- Versão do modelo de POM exigida pelo Maven. -->
     <modelVersion>4.0.0</modelVersion>
 
+    <!-- Coordenadas do artefato gerado: br.uesc:quoridor-rmi:1.0.0 -->
     <groupId>br.uesc</groupId>
     <artifactId>quoridor-rmi</artifactId>
     <version>1.0.0</version>
 
+    <!-- Propriedades do build: compilar para Java 17, fontes em UTF-8. -->
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
+    <!-- Plugins que participam do ciclo de build. -->
     <build>
         <plugins>
+            <!-- Gera o JAR e declara, no manifesto, a classe principal
+                 padrão do pacote: o servidor (ServerMain). -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-jar-plugin</artifactId>
@@ -28,6 +43,7 @@
                     </archive>
                 </configuration>
             </plugin>
+            <!-- Compila os fontes Java usando o nível de linguagem do Java 17. -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>

@@ -1,3 +1,9 @@
+<!--
+  Função deste arquivo: ser a documentação principal do projeto.
+  Ele explica o que é o jogo, as regras implementadas, a arquitetura
+  distribuída com Java RMI e o passo a passo para compilar, iniciar o
+  servidor e conectar os 4 clientes (interface gráfica e modo console).
+-->
 # Quoridor distribuído com Java RMI
 
 Implementação de Quoridor para **4 jogadores**, usando:
@@ -28,6 +34,7 @@ Implementação de Quoridor para **4 jogadores**, usando:
 - Uma parede nunca pode eliminar o caminho de algum jogador até seu objetivo.
 - O servidor controla o estado e valida todas as jogadas.
 - A partida começa quando os 4 clientes entram.
+- Se um jogador sai (`sair`) ou o processo do cliente encerra, a partida termina e os demais são avisados de quem se desconectou.
 
 ## Arquitetura
 
